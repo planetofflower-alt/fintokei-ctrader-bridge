@@ -3,25 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any
 
-try:
-    from twisted.internet import asyncioreactor
+from twisted.internet import reactor
 
-    asyncioreactor.install()
-except Exception:  # reactor already installed by an embedder
-    pass
-
-from twisted.internet import reactor  # noqa: E402
-from twisted.internet.defer import Deferred  # noqa: E402
-
-from ctrader_open_api import Client, EndPoints  # noqa: E402
-from ctrader_open_api.client import Protobuf  # noqa: E402
-from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *  # noqa: E402,F401,F403
-from ctrader_open_api.messages.OpenApiMessages_pb2 import *  # noqa: E402,F401,F403
-from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *  # noqa: E402,F401,F403
-from ctrader_open_api.tcpProtocol import TcpProtocol  # noqa: E402
+from ctrader_open_api import Client, EndPoints
+from ctrader_open_api.client import Protobuf
+from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *  # noqa: F401,F403
+from ctrader_open_api.messages.OpenApiMessages_pb2 import *  # noqa: F401,F403
+from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *  # noqa: F401,F403
+from ctrader_open_api.tcpProtocol import TcpProtocol
 
 PRICE_DIVISOR = 100_000
 VOLUME_PER_LOT = 100  # API volume unit is 0.01 lot
@@ -49,22 +42,23 @@ _PERIOD_MS = {
 
 _ERROR_MESSAGES = {"ProtoOAErrorRes", "ProtoOAOrderErrorEvent"}
 
+_reactor_started = False
+_reactor_lock = threading.Lock()
 
-def _to_future(deferred: Deferred) -> asyncio.Future:
-    future = asyncio.Future()
 
-    def ok(result):
-        if not future.done():
-            future.get_loop().call_soon_threadsafe(future.set_result, result)
-
-    def err(failure):
-        if not future.done():
-            future.get_loop().call_soon_threadsafe(
-                future.set_exception, failure.value
-            )
-
-    deferred.addCallbacks(ok, err)
-    return future
+def _ensure_reactor_thread() -> None:
+    global _reactor_started
+    with _reactor_lock:
+        if _reactor_started:
+            return
+        thread = threading.Thread(
+            target=reactor.run,
+            kwargs={"installSignalHandlers": False},
+            daemon=True,
+            name="ctrader-reactor",
+        )
+        thread.start()
+        _reactor_started = True
 
 
 class BridgeError(Exception):
@@ -86,6 +80,9 @@ class CTraderBridge:
         self.client: Client | None = None
         self.symbols_by_name: dict[str, dict[str, Any]] = {}
         self._spot_waiters: dict[int, asyncio.Future] = {}
+        self._connect_future: asyncio.Future | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._account_id: int = 0
 
     # ------------------------------------------------------------------
     # connection / auth
@@ -97,42 +94,61 @@ class CTraderBridge:
                 "CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID)"
             )
 
+        self._loop = asyncio.get_running_loop()
+        connected = self._loop.create_future()
+        self._connect_future = connected
+
         host = (
             EndPoints.PROTOBUF_LIVE_HOST
             if self.config.host == "live"
             else EndPoints.PROTOBUF_DEMO_HOST
         )
-        self.client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
 
-        loop = asyncio.get_running_loop()
-        connected = loop.create_future()
-        self.client.setConnectedCallback(
-            lambda _client: loop.call_soon_threadsafe(
-                connected.set_result, True
+        def _setup() -> None:
+            self.client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
+            self.client.setConnectedCallback(
+                lambda _client: self._set_future(connected, True)
             )
-            if not connected.done()
-            else None
-        )
-        self.client.setDisconnectedCallback(self._on_disconnected)
-        self.client.setMessageReceivedCallback(self._on_message)
-        self.client.startService()
+            self.client.setDisconnectedCallback(self._on_disconnected)
+            self.client.setMessageReceivedCallback(self._on_message)
+            self.client.startService()
+
+        _ensure_reactor_thread()
+        reactor.callFromThread(_setup)
 
         await asyncio.wait_for(connected, timeout=CONNECT_TIMEOUT_S)
         await self._app_auth()
+        await self._resolve_account_id()
         await self._account_auth()
         await self._load_symbols()
 
-    def _on_disconnected(self, _client, reason) -> None:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
+    def _set_future(self, future: asyncio.Future | None, value: Any) -> None:
+        if future is None or self._loop is None:
             return
-        loop.call_soon_threadsafe(self._fail_spot_waiters, reason)
 
-    def _fail_spot_waiters(self, reason) -> None:
-        for fut in self._spot_waiters.values():
-            if not fut.done():
-                fut.set_exception(NotConnectedError(str(reason)))
+        def _resolve() -> None:
+            if not future.done():
+                future.set_result(value)
+
+        self._loop.call_soon_threadsafe(_resolve)
+
+    def _fail_future(self, future: asyncio.Future, error: Exception) -> None:
+        def _reject() -> None:
+            if not future.done():
+                future.set_exception(error)
+
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(_reject)
+
+    def _on_disconnected(self, _client, reason) -> None:
+        error = NotConnectedError(str(reason))
+        if self._connect_future is not None:
+            self._fail_future(self._connect_future, error)
+        self._fail_spot_waiters(error)
+
+    def _fail_spot_waiters(self, error: Exception) -> None:
+        for fut in list(self._spot_waiters.values()):
+            self._fail_future(fut, error)
         self._spot_waiters.clear()
 
     def _on_message(self, _client, message) -> None:
@@ -142,27 +158,29 @@ class CTraderBridge:
             return
         name = inner.DESCRIPTOR.name
         if name == "ProtoOASpotEvent":
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                return
-            loop.call_soon_threadsafe(self._resolve_spot, inner)
+            self._set_future(
+                self._spot_waiters.get(inner.symbolId), inner
+            )
         elif name == "ProtoOAOrderErrorEvent":
             pass  # delivered to the pending _send() caller too
 
-    def _resolve_spot(self, event) -> None:
-        fut = self._spot_waiters.get(event.symbolId)
-        if fut is not None and not fut.done():
-            fut.set_result(event)
-
     async def _send(self, request):
         """Send a request and return the extracted response message."""
-        if self.client is None:
+        if self.client is None or self._loop is None:
             raise NotConnectedError("not connected")
-        deferred = self.client.send(
-            request, responseTimeoutInSeconds=REQUEST_TIMEOUT_S
-        )
-        wrapper = await _to_future(deferred)
+        future = self._loop.create_future()
+
+        def _do_send() -> None:
+            deferred = self.client.send(
+                request, responseTimeoutInSeconds=REQUEST_TIMEOUT_S
+            )
+            deferred.addCallbacks(
+                lambda result: self._set_future(future, result),
+                lambda failure: self._fail_future(future, failure.value),
+            )
+
+        reactor.callFromThread(_do_send)
+        wrapper = await future
         response = Protobuf.extract(wrapper)
         name = response.DESCRIPTOR.name
         if name in _ERROR_MESSAGES:
@@ -178,9 +196,28 @@ class CTraderBridge:
         )
         await self._send(req)
 
+    async def _resolve_account_id(self) -> None:
+        """Accept either the visible account number or the internal id."""
+        res = await self._send(
+            ProtoOAGetAccountListByAccessTokenReq(
+                accessToken=self.config.access_token
+            )
+        )
+        configured = int(self.config.account_id)
+        logins: list[str] = []
+        for account in res.ctidTraderAccount:
+            logins.append(str(account.traderLogin))
+            if configured in (account.ctidTraderAccountId, account.traderLogin):
+                self._account_id = account.ctidTraderAccountId
+                return
+        raise BridgeError(
+            f"account {self.config.account_id} not authorised for this token "
+            f"(authorised account numbers: {', '.join(logins) or 'none'})"
+        )
+
     async def _account_auth(self) -> None:
         req = ProtoOAAccountAuthReq(
-            ctidTraderAccountId=self.config.account_id,
+            ctidTraderAccountId=self._account_id,
             accessToken=self.config.access_token,
         )
         await self._send(req)
@@ -188,7 +225,7 @@ class CTraderBridge:
     async def _load_symbols(self) -> None:
         res = await self._send(
             ProtoOASymbolsListReq(
-                ctidTraderAccountId=self.config.account_id,
+                ctidTraderAccountId=self._account_id,
                 includeArchivedSymbols=False,
             )
         )
@@ -200,7 +237,7 @@ class CTraderBridge:
         for i in range(0, len(ids), chunk):
             detail_res = await self._send(
                 ProtoOASymbolByIdReq(
-                    ctidTraderAccountId=self.config.account_id,
+                    ctidTraderAccountId=self._account_id,
                     symbolId=ids[i : i + chunk],
                 )
             )
@@ -227,7 +264,7 @@ class CTraderBridge:
     # ------------------------------------------------------------------
     async def get_account_and_orders(self) -> dict[str, Any]:
         res = await self._send(
-            ProtoOAReconcileReq(ctidTraderAccountId=self.config.account_id)
+            ProtoOAReconcileReq(ctidTraderAccountId=self._account_id)
         )
         positions = [
             {
@@ -259,11 +296,11 @@ class CTraderBridge:
 
     async def get_quote(self, symbol: str) -> dict[str, Any]:
         symbol_id = self._symbol_id(symbol)
-        waiter = asyncio.get_running_loop().create_future()
+        waiter = self._loop.create_future()
         self._spot_waiters[symbol_id] = waiter
         try:
             sub = ProtoOASubscribeSpotsReq(
-                ctidTraderAccountId=self.config.account_id,
+                ctidTraderAccountId=self._account_id,
                 symbolId=[symbol_id],
             )
             await self._send(sub)
@@ -279,7 +316,7 @@ class CTraderBridge:
             try:
                 await self._send(
                     ProtoOAUnsubscribeSpotsReq(
-                        ctidTraderAccountId=self.config.account_id,
+                        ctidTraderAccountId=self._account_id,
                         symbolId=[symbol_id],
                     )
                 )
@@ -294,7 +331,7 @@ class CTraderBridge:
         span = _PERIOD_MS.get(period, 60 * 60_000) * (count + 5)
         res = await self._send(
             ProtoOAGetTrendbarsReq(
-                ctidTraderAccountId=self.config.account_id,
+                ctidTraderAccountId=self._account_id,
                 symbolId=symbol_id,
                 period=period,
                 fromTimestamp=now_ms - span,
@@ -329,7 +366,7 @@ class CTraderBridge:
     ) -> dict[str, Any]:
         symbol_id = self._symbol_id(symbol)
         req = ProtoOANewOrderReq(
-            ctidTraderAccountId=self.config.account_id,
+            ctidTraderAccountId=self._account_id,
             symbolId=symbol_id,
             orderType=ProtoOAOrderType.LIMIT,
             tradeSide=(
@@ -358,7 +395,7 @@ class CTraderBridge:
     async def cancel_order(self, order_id: int) -> dict[str, Any]:
         event = await self._send(
             ProtoOACancelOrderReq(
-                ctidTraderAccountId=self.config.account_id,
+                ctidTraderAccountId=self._account_id,
                 orderId=order_id,
             )
         )

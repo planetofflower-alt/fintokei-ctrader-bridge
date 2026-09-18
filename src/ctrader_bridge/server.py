@@ -200,7 +200,7 @@ class CTraderMCPServer:
         if name == "get_account_status":
             data = await self.bridge.get_account_and_orders()
             data["host"] = self.config.host
-            data["account_id"] = self.config.account_id
+            data["account_id"] = self.bridge._account_id
             return data
         if name == "list_symbols":
             filt = (args.get("filter") or "").upper()
