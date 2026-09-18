@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fintokei-ctrader-bridge"
+version = "0.1.0"
+description = "Safety-gated cTrader MCP bridge: read-only market data plus human-approved limit orders"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.9.0,<2",
+    "ctrader-open-api>=0.9.0,<0.10",
+    "Twisted>=24.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+fintokei-ctrader-bridge = "ctrader_bridge.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ctrader_bridge"]
