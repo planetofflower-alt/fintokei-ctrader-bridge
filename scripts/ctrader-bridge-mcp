@@ -1,0 +1,23 @@
+#!/bin/sh
+# Launcher for the fintokei cTrader MCP bridge (stdio).
+# Creates a private venv, installs the bridge from GitHub once, then execs it.
+set -e
+VENV_DIR="$HOME/.ctrader-bridge-venv"
+PY=""
+for cand in python3.13 python3.12 python3.11 python3.10 python3; do
+    if command -v "$cand" >/dev/null 2>&1; then
+        PY="$cand"
+        break
+    fi
+done
+if [ -z "$PY" ]; then
+    echo "ctrader-bridge-mcp: no python >= 3.10 found" >&2
+    exit 1
+fi
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+    "$PY" -m venv "$VENV_DIR"
+fi
+if ! "$VENV_DIR/bin/pip" -q show fintokei-ctrader-bridge >/dev/null 2>&1; then
+    "$VENV_DIR/bin/pip" install -q "git+https://github.com/planetofflower-alt/fintokei-ctrader-bridge"
+fi
+exec "$VENV_DIR/bin/python" -m ctrader_bridge
