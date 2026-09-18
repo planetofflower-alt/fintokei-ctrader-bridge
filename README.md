@@ -58,6 +58,10 @@ python -m ctrader_bridge
 
 STDIO 型の MCP サーバーとして起動します。
 
+## セットアップの詳しい手順
+
+→ [docs/SETUP_GUIDE_JA.md](docs/SETUP_GUIDE_JA.md)（認証情報の発行からDevin登録・使い方まで、初心者向けに順番で解説）
+
 ## Devin への接続（B案: セッション内 STDIO）
 
 Devin の組織設定にカスタム MCP サーバーとして登録します。
